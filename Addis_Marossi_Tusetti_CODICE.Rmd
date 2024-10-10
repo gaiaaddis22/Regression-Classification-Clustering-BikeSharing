@@ -1,0 +1,1559 @@
+---
+title: "ML_AddisMarossiTusetti"
+author: "Clara Marossi"
+date: "2024-06-12"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE,warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+Caricamento di tutte le librerie necessarie.
+
+```{r}
+library(tidyverse)
+library(ggcorrplot)
+library(dbscan)
+library(e1071)
+library(mlrMBO)
+library(neuralnet)
+library(lubridate)
+library(reshape2)
+library(gridExtra)
+library(clusterSim)
+library(randomForest)
+library(Boruta)
+library(clValid) 
+library(cluster)
+library(rgenoud)
+library(caret)
+library(class)
+library(clustMixType)
+library(nnet)
+library(xgboost)
+library(pROC)
+library(reshape2)
+library(kknn)
+library(plotly)
+library(viridis)
+library(ggrepel)
+```
+
+Caricamento del dataset e modifica dei nomi delle colonne.
+
+```{r}
+setwd("/Users/gaiaaddis22/Desktop/ML FINAL PROJ INVIATO/ML_proj")
+data <- read.csv("SeoulBikeData.csv",sep=",",check.names = F)
+colnames(data) <- c("Date","Count","Hour","Temp","Humidity","WindSpeed",
+                    "Visibility","DewPointTemp","SolarRad","Rain","Snow",
+                    "Season","Holiday","FunctioningDay")
+```
+
+# Pre-processing e EDA
+
+Eliminiamo dal dataset i giorni in cui il sistema di noleggio non era in funzione (FunctioningDay = "No") perchè pochi (3%) e dunque irrilevanti. Poi modifichiamo il formato delle variabili dummy e della data.
+
+```{r}
+tab <- table(data$FunctioningDay)
+data <- data %>%
+  filter(FunctioningDay != "No") %>%
+  dplyr::select(-FunctioningDay)
+
+data <- data %>% 
+  mutate(Season = as.factor(Season),
+         Holiday = as.factor(Holiday),
+         Date = dmy(Date))
+
+cat("Percentuale di giornate nulle:", tab[1]/tab[2]*100, "%\n")
+```
+
+Non sono presenti missing values.
+
+```{r}
+sum(is.na(data))
+```
+
+Valutiamo ora la correlazione tra le variabili quantitative.
+
+```{r}
+correlazione <- cor(data[,c("Count","Temp","Humidity","WindSpeed","Visibility",
+                            "DewPointTemp","SolarRad","Rain","Snow")])
+# round(correlazione,2)
+ggcorrplot(correlazione, type = "upper", lab = T, colors = c("deepskyblue","white","red2"),
+           title = "Correlation Matrix") + 
+  theme(plot.title = element_text(size=22, color="black", face = "bold",family = "Tahoma"), axis.text.x = element_text(angle = 90)) + 
+  labs(x= " " , y = " ")  +
+  theme_void()
+  
+```
+
+Data l'elevata correlazione tra le variabili Temp e DewPointTemp (punto di rugiada) decidiamo di eliminare la seconda.
+
+```{r}
+data <- data %>%
+  dplyr::select(-DewPointTemp)
+```
+
+Visualizziamo alcuni boxplot della variabile risposta Count, condizionatamente alle variabili categoriche Holiday, Season ed entrambe congiutamente.
+
+```{r}
+# Boxplot of Count by Holiday
+ggplot(data, aes(x = Holiday, y = Count, fill = Holiday)) + 
+  geom_boxplot() + 
+  theme_test() + 
+  coord_flip() + 
+  scale_fill_manual(values = c("deepskyblue", "red2"))
+
+# Boxplot of Count by Season
+ggplot(data, aes(x = Season, y = Count, fill = Season)) + 
+  geom_boxplot() + 
+  theme_test() + 
+  coord_flip() + 
+  scale_fill_manual(values = c("brown2", "lightgreen", "yellow", "lightblue"))
+
+# Boxplot of Count by Season & Holiday
+ggplot(data, aes(x = Holiday, y = Count, fill = Season)) + 
+  geom_boxplot() + 
+  theme_test() + 
+  coord_flip() + 
+  scale_fill_manual(values = c("brown2", "lightgreen", "yellow", "lightblue"))
+```
+
+*Commenti:* Dai boxplot notiamo che la domanda di bicilette sembra essere leggermente minore quando la giornata è festiva (1), mentre si nota un marcato calo di domanda nella stagione invernale ed uno più leggero in primavera (2).
+
+Visualizziamo infine gli isogrammi delle variabili quantitative.
+
+```{r}
+ggplot(melt(data[,-c(1,3,11,12)],id.vars=NULL), aes(x=value)) +
+  geom_histogram(aes(y=after_stat(density)),fill="deepskyblue",color="black",bins=10) +
+  facet_wrap(~variable,scales="free") +
+  geom_density(fill="lightblue", alpha=0.3) + 
+  labs(x=" ",y=" ") +
+  theme_test() +
+  theme(
+    strip.background = element_rect(fill = "lightblue", color = "black"),
+    strip.text = element_text(color = "black", size = 10, face="bold") 
+  )
+```
+
+E' ben evidente la diversa scala dei dati (i.e. visibility in centinaia/migliaia vs windspeed in decine), pertanto per la fase di modeling andremo a scalare i dati.
+
+Inoltre, notiamo che le variabili "Rain" e "Snow" hanno una distribuzione molto concentrata sullo zero (zero inflated) a causa della natura stessa dei dati, per questo motivo creiamo due dummy per la presenza/assenza del fenomeno, che potrebbero essere utili nelle fasi successive.
+
+```{r}
+data <- data %>%
+  mutate(Rain_dummy = cut(Rain,
+                    breaks = c(-Inf, 10^(-10), 5, Inf),
+                    labels = c("No rain", "Low rain", "Elevate rain"),
+                    right = FALSE)) %>%
+  mutate(Rain_dummy = as.factor(Rain_dummy))
+
+data <- data %>%
+  mutate(Snow_dummy = ifelse(Snow == 0, "No snow", "Snow")) %>%
+  mutate(Snow_dummy = as.factor(Snow_dummy))
+```
+
+A partire dalla variabile "Date" creiamo due ulteriori variabili contenenti il giorno della settimana e il mese.
+
+```{r}
+Sys.setlocale("LC_TIME", "English") 
+data <- data %>% 
+  mutate(Month = month(Date, label = TRUE, abbr = TRUE),
+         WeekDay = wday(Date, label = TRUE, abbr = FALSE ))
+```
+
+Visualizziamo ora gli istogrammi della variabile dipendente "Count" a seconda di alcune variabili temporali, per capire quale potrebbe essere la relazione che le lega.
+
+```{r}
+g1 <- ggplot(data, aes(x = WeekDay, y = Count, fill="deepskyblue")) +
+  geom_bar(stat = "identity") +
+  labs(title = "Count per Weekday", x = "Weekday", y = "Count") +
+  theme_minimal() +
+  scale_fill_manual(values = c("deepskyblue")) +
+  guides(fill = FALSE)
+  
+g2 <- ggplot(data, aes(x = Month, y = Count, fill="deepskyblue")) +
+  geom_bar(stat = "identity") +
+  labs(title = "Count per Month", x = "Month", y = "Count") +
+  theme_minimal() +
+  scale_fill_manual(values = c("deepskyblue")) +
+  guides(fill = FALSE)
+
+g3 <- ggplot(data, aes(x = Season, y = Count, fill = Season)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Count per Season", x = "Season", y = "Count") +
+  theme_minimal() +
+  scale_fill_manual(values = c("brown2", "lightgreen", "yellow", "lightblue"))
+
+g4 <- ggplot(data, aes(x = Hour, y = Count, fill="deepskyblue")) +
+  geom_bar(stat = "identity") +
+  labs(title = "Count per Hour", x = "Hour", y = "Count") +
+  theme_minimal() +
+  scale_fill_manual(values = c("deepskyblue")) +
+  guides(fill = FALSE)
+  
+grid.arrange(g1,g2,g3,g4)
+```
+
+A conferma dei boxplot, si nota che la domanda di bici è molto più bassa nei mesi invernali. Inoltre, si notano dei picchi in corrispondenza degli orari di entrata e uscita dal lavoro.
+
+Tali picchi dovrebbero essere presenti solo nei giorni lavorativi, verifichiamolo con un grafico a 3 variabili.
+
+```{r}
+grafico <- data %>%
+  group_by(Hour,WeekDay) %>%
+  summarise(n=sum(Count))
+
+ggplot(grafico, aes(x = Hour, y = n, color = WeekDay, group = WeekDay)) +
+  geom_point(size = 2) +
+  geom_line() +
+  labs(x = "Hour", y = "Count", color = "WeekDay") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+A conferma di quanto detto sopra, si notano 2 trend ben distinti per i giorni infrasettimanali (Mon - Fri) e il weekend (Sat - Sun).
+
+Dunque, creiamo una nuova variabile categorica che discrimini tra weekend e giorno infrasettimanale così da poter cogliere il diverso trend.
+
+```{r}
+data <- data %>%
+  mutate(Weekend = as.factor(if_else(WeekDay %in% c("Saturday", "Sunday"), "Weekend", "Weekwork")))
+```
+
+Sfruttando il Local Outlier Factor (LOF) score, individuiamo i punti "candidati" come valori anomali. Come valore soglia scegliamo il classico 1.5.
+
+```{r}
+data_num <- data %>%
+  dplyr::select(Temp, Humidity, WindSpeed, Visibility, SolarRad, Count) 
+lof_scores <- lof(as.matrix(data_num), minPts = 5)
+data$LOF_score <- lof_scores
+outliers_lof <- which(data$LOF_score > 1.5)
+
+percentuale_outliers <- length(outliers_lof)/dim(data)[1] * 100
+cat("Numero di outlier:", length(outliers_lof), "\n")
+cat("Percentuale di outlier:", percentuale_outliers, "%\n")
+```
+
+Dall'analisi di questi punti, che rappresentano circa il 2% del totale, abbiamo notato la presenza di valori con % di umidità pari a 0. Dal momento che ciò è praticamente impossibile in condizioni naturali, abbiamo deciso di eliminare queste osservazioni (essendo isolated anomalies).
+
+```{r}
+data <- data %>%
+  filter(Humidity!=0) %>%
+  dplyr::select(-c(LOF_score))
+```
+
+# Variable Importance
+
+Per valutare l'influenza delle variabili nel determinare la domanda di biciclette sfruttiamo il metodo ***Boruta***, che consiste in un'estensione delle Random Forest applicate alla feature selection.
+
+```{r}
+data <- data %>%
+  mutate(Control1 = rpois(dim(data)[1],50), Control2 = rnorm(dim(data)[1],-1,10)) # variabili di controllo
+boruta_output <- Boruta(Count ~ Hour + Humidity + SolarRad + Temp + Weekend + Visibility + WeekDay + WindSpeed + Rain + Snow + Month + Season + Holiday + Control1 + Control2,data=data, doTrace=3) 
+plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Variable Importance") 
+data <- data %>%
+  dplyr::select(-c(Control1,Control2))
+```
+
+I risultati ottenuti ci permettono di concludere che tutte le variabili, seppur in percentuale diversa, sono importanti. Tra tutte, spicca "Hour", che risulta essere la più significativa, ma, al contempo, molto complessa da trattare.
+
+Infatti potrebbe essere trattata sia come variabile dummy (che però comporterebbe l'introduzione di un numero di variabili troppo elevato) oppure come variabile numerica (perdendo però la sua natura ciclica).
+
+Un metodo molto utilizzato in letteratura per contrastare questo fenomeno è l'utilizzo delle sinusoidi.
+
+Per questo motivo, creiamo due nuove variabili, "sinHour" e "cosHour".
+
+```{r}
+data <- data %>%
+  mutate(sinHour = sin(2*pi*Hour/24),
+         cosHour = cos(2*pi*Hour/24)) 
+```
+
+# Clustering
+
+## K-means
+
+Prima di tutto, selezioniamo solo le variabili numeriche presenti nel dataset e scaliamo i dati (per fare in modo che la scala dei dati non influenzi il calcolo delle distanze).\
+Notiamo che le variabili "sinHour" e "cosHour" non necessitano di essere scalate, dal momento che, per la loro natura, variano nell'intervallo (0,1).
+
+```{r}
+data_num <- scale(data[,c("Temp", "Humidity", "WindSpeed", "Visibility", "SolarRad")])
+data_num <- data.frame(cbind(data_num),data$sinHour,data$cosHour)
+```
+
+Prima di implementare un KNN, è necessario scegliere il numero di k, ovvero numero dei gruppi (clusters). Per farlo utlizziamo due misure: la Sum of Squares (SSQ) e la silhouette.
+
+**Metodo 1: SSQ**\
+Per la "regola del gomito" scegliamo k = 4.
+
+```{r}
+SSQs <- NULL
+kappas <- 2:10
+set.seed(123)
+for( k in kappas ) {
+  ssqs <- numeric()
+  for (rep in 1:10) {
+    km.res <- kmeans( data_num, centers=k )  
+    ssqs <- c(ssqs, km.res$tot.withinss)
+  }
+  SSQs <- cbind(SSQs, ssqs)
+}
+avg <- apply(SSQs, 2, mean) 
+plot( kappas, avg, type="o", lwd=3, col="blue", main="Average SSQs for Different k" )
+```
+
+**Metodo 2: Silhouette**\
+La silhouette individua 2 gruppi.
+
+```{r}
+sils <- numeric()
+kappas <- 2:10
+
+for(k in kappas) {
+  res <- kmeans(data_num, centers = k)
+  sil <- silhouette(res$cluster, dist(data_num))
+  mean_sil <- mean(sil[, 3])
+  sils <- c(sils, mean_sil)
+}
+
+plot(kappas, sils, type = "b", pch = 19, col = "blue", xlab = "Number of Clusters (k)", ylab = "Average Silhouette Width", main = "Average Silhouette Width for Different k")
+abline(v = kappas[which.max(sils)], col = "red", lty = 2)
+```
+
+Le due metriche indichino due scelte diverse, li proviamo entrambi per potere fare il confronto.\
+Dopo aver individuato i cluster, calcoliamo le medie per gruppo al fine di studiarne le peculiarità.
+
+```{r}
+set.seed(123)
+k <- 2
+res <- kmeans(data_num, centers = k, iter.max = 10000) 
+data$clust_KMEANS <- res$cluster
+
+data %>%
+  group_by(clust_KMEANS) %>%
+  summarise(across(c(Count, SolarRad, Temp, Humidity, WindSpeed, Visibility, Rain, Snow), ~ mean(.)))
+
+
+grafico <- data %>%
+  group_by(clust_KMEANS, Season) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  group_by(clust_KMEANS) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+grafico <- grafico %>%
+  arrange(clust_KMEANS, desc(Season)) %>%
+  mutate(ypos = cumsum(percentage) - 0.5 * percentage)
+
+ggplot(grafico, aes(x = "", y = percentage, fill = Season)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_label_repel(aes(label = paste0(round(percentage, 1), "%"), y = ypos), 
+                   fill = "white",  
+                   color = "black", 
+                   show.legend = FALSE, 
+                   box.padding = 0.3,
+                   point.padding = 0.3,
+                   segment.color = "black", 
+                   nudge_x = 0.8) +
+  labs(x = "Cluster", y = "Percentage", fill = "Season") +
+  theme_void() +
+  scale_fill_manual(values = c("brown2", "lightgreen", "yellow", "lightblue")) +
+  facet_wrap(~ clust_KMEANS, strip.position = "top") +
+  theme(strip.placement = "outside", strip.background = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"))
+
+```
+
+Quando eseguiamo per k=2, vediamo dai centroidi che le variabili atmosferiche non sono ben distinte.\
+Proviamo quindi a studiare l'orario.
+
+```{r}
+
+grafico <- data %>%
+  group_by(clust_KMEANS, Hour) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  group_by(clust_KMEANS) %>%
+  mutate(percentage = count / sum(count) * 100) %>%
+  arrange(clust_KMEANS, desc(Hour)) %>%
+  mutate(ypos = cumsum(percentage) - 0.5 * percentage)
+
+ggplot(grafico, aes(x = "", y = percentage, fill = as.factor(Hour))) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  labs(x = NULL, y = NULL, fill = NULL) +  
+  theme_void() +
+  scale_fill_manual(values = c(rep("darkblue", 8), rep("red", 3), rep("yellow", 7), rep("red", 3), rep("darkblue", 3))) +
+  facet_wrap(~ clust_KMEANS, strip.position = "top") +
+  theme(strip.placement = "outside", strip.background = element_blank(),
+        strip.text = element_text(size = 12, face = "bold")) +
+  guides(fill = FALSE) 
+
+```
+
+## Algoritmo gerarchico (bottom-up)
+
+**Scelta del numero di gruppi**\
+In questo caso abbiamo usato la silhouette media come metrica per la scelta del numero dei gruppi. Come in precedenza, eseguiamo sia per k=2 che k=4.
+
+```{r}
+distanze <- dist(data_num)
+
+sils <- numeric()
+kappas <- 2:10
+
+for(k in kappas) {
+  res <- hclust(distanze, method="ward.D2")
+  cluster <- cutree(res, k=k)
+  sil <- silhouette(cluster, dist(data_num))
+  mean_sil <- mean(sil[, 3])
+  sils <- c(sils, mean_sil)
+}
+
+plot(kappas, sils, type = "b", pch = 19, col = "blue", xlab = "Number of Clusters (k)", ylab = "Average Silhouette Width", main = "Average Silhouette Width for Different k")
+abline(v = kappas[which.max(sils)], col = "red", lty = 2)
+```
+
+NB: Abbiamo provato anche più metodi per l'aggregazione dei gruppi (single, complete e average linkage), ma i risultati migliori sono stati quelli ottenuti con il metodo di Ward.
+
+**Clustering**
+
+```{r}
+h.res <- hclust( distanze, method="ward.D2" )
+data$clust_HIER <- cutree(h.res, k=4)
+
+data %>%
+  group_by(clust_HIER) %>%
+  summarise(mean(Count),mean(SolarRad),mean(Temp),mean(Humidity),mean(WindSpeed),
+            mean(Visibility),mean(Rain),mean(Snow))
+
+grafico <- data %>%
+  group_by(clust_HIER, Season) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  group_by(clust_HIER) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+grafico <- grafico %>%
+  arrange(clust_HIER, desc(Season)) %>%
+  mutate(ypos = cumsum(percentage) - 0.5 * percentage)
+
+ggplot(grafico, aes(x = "", y = percentage, fill = Season)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_label_repel(aes(label = paste0(round(percentage, 1), "%"), y = ypos), 
+                   fill = "white",  
+                   color = "black", 
+                   show.legend = FALSE, 
+                   box.padding = 0.3,
+                   point.padding = 0.3,
+                   segment.color = "black", 
+                   nudge_x = 0.8) +
+  labs(x = "Cluster", y = "Percentage", fill = "Season") +
+  theme_void() +
+  scale_fill_manual(values = c("brown2", "lightgreen", "yellow", "lightblue")) +
+  facet_wrap(~ clust_HIER, strip.position = "top") +
+  theme(strip.placement = "outside", strip.background = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"))
+  
+```
+
+Proviamo ora a tenere conto anche delle variabili categoriche per la creazione dei gruppi.
+
+## Partitioning Around Medoids
+
+**Trasformazione dei dati e scelta del numero ottimale di gruppi\
+**Per la scelta del numero di gruppi usiamo sempre la silhouette media, calcolata però sfruttando la distanza di Gower.
+
+```{r}
+catnum_data <- data %>%
+  dplyr::select(Temp, Humidity, WindSpeed, Visibility, SolarRad,
+                Rain_dummy, Snow_dummy, Season, sinHour, cosHour,
+                Month, WeekDay, Weekend) %>%
+  mutate(Rain_dummy = as.factor(Rain_dummy),
+         Snow_dummy = as.factor(Snow_dummy),
+         Season = as.factor(Season),
+         Month = as.factor(Month),
+         WeekDay = as.factor(WeekDay),
+         Weekend = as.factor(Weekend))
+
+gower_dist <- daisy(catnum_data, metric = "gower")
+
+
+sils <- numeric()
+kappas <- 2:10
+
+for(k in kappas) {
+  res <- pam(gower_dist, k = k)
+  cluster <- res$clustering
+  mean_sil <- mean(silhouette(cluster,gower_dist)[,3])
+  sils <- c(sils, mean_sil)
+}
+
+plot(kappas, sils, type = "b", pch = 19, col = "blue", xlab = "Number of Clusters (k)", ylab = "Average Silhouette Width", main = "Average Silhouette Width for Different k")
+abline(v = kappas[which.max(sils)], col = "red", lty = 2)
+```
+
+Suggerisce k=5
+
+```{r}
+clustering_cat.num <- pam(gower_dist, k = 5)
+
+data$clust_FAC.NUM <- clustering_cat.num$clustering
+
+data %>%
+  group_by(clust_FAC.NUM) %>%
+  summarise(mean(Count),mean(SolarRad),mean(Temp),mean(Humidity),mean(WindSpeed),
+            mean(Visibility),mean(Rain),mean(Snow))
+
+grafico <- data %>%
+  group_by(clust_FAC.NUM, Season) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  group_by(clust_FAC.NUM) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+grafico <- grafico %>%
+  arrange(clust_FAC.NUM, desc(Season)) %>%
+  mutate(ypos = cumsum(percentage) - 0.5 * percentage)
+
+ggplot(grafico, aes(x = "", y = percentage, fill = Season)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_label_repel(aes(label = paste0(round(percentage, 1), "%"), y = ypos), 
+                   fill = "white",  
+                   color = "black", 
+                   show.legend = FALSE, 
+                   box.padding = 0.3,
+                   point.padding = 0.3,
+                   segment.color = "black", 
+                   nudge_x = 0.8) +
+  labs(x = "Cluster", y = "Percentage", fill = "Season") +
+  theme_void() +
+  scale_fill_manual(values = c("brown2", "lightgreen", "yellow", "lightblue")) +
+  facet_wrap(~ clust_FAC.NUM, strip.position = "top") +
+  theme(strip.placement = "outside", strip.background = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"))
+```
+
+```{r}
+data <- data %>%
+  dplyr::select(-c(clust_KMEANS, clust_HIER, clust_FAC.NUM))
+```
+
+# Suddivisione del dataset in training e test
+
+Suddividiamo ora il dataset in training e test set.
+
+```{r}
+set.seed(123)
+ixs <- createDataPartition(data$Count,time=1,p=0.8) 
+trainset <- data[ixs$Resample1,]
+testset <- data[-ixs$Resample1,]
+```
+
+Al fine di utilizzare le variabili categoriche nei successivi algoritmi, per ognuna creiamo tante dummy quante sono le sue modalità, utilizzando la tecnica del ***One-Hot Encoding***.
+
+```{r}
+dummies <- dummyVars(~ Season + Holiday + WeekDay + Weekend,
+                     data = data)
+one_hot_data <- predict(dummies, newdata = data) %>% as_tibble()
+scaled_data <- data %>%
+  dplyr::select(Temp, Humidity, WindSpeed, Visibility, SolarRad, Rain, Snow) %>%
+  scale() %>%
+  as_tibble()
+data_encoded <- data %>%
+  dplyr::select(Count, sinHour, cosHour) %>%
+  bind_cols(scaled_data, one_hot_data)
+
+colnames(data_encoded) <- c("Count", "sinHour", "cosHour","Temp", "Humidity", "WindSpeed", "Visibility","SolarRad", "Rain", "Snow","SeasonAutumn", "SeasonSpring", "SeasonSummer", "SeasonWinter","HolidayHoliday", "HolidayNoHoliday","WeekDay1", "WeekDay2", "WeekDay3", "WeekDay4", "WeekDay5", "WeekDay6","WeekendWeekend", "WeekendWeekwork")
+```
+
+Infine, creiamo training e test anche per il dataset completo (cioè con le dummy trasformate).
+
+```{r}
+trainset_encoded <- data_encoded[ixs$Resample1,]
+testset_encoded <- data_encoded[-ixs$Resample1,]
+```
+
+# Regressione
+
+Creiamo delle funzioni per calcolare le metriche di bontà della regressione: errore quadratico medio (RMSE), errore assoluto medio (MAE), coefficiente di determinazione (R2) e errore assoluto medio percentuale (MAPE).
+
+```{r}
+rmse <- function(pred,actual) {sqrt(mean((pred - actual)^2))}
+mae <- function(pred,actual) {mean(abs(pred - actual))}
+r_squared <- function(pred,actual) {
+  rss <- sum((pred - actual)^2)
+  tss <- sum((actual - mean(actual))^2)
+  1 - (rss / tss)
+  }
+mape <- function(pred,actual) {mean(abs((actual - pred) / actual)) * 100}
+msee <- function(pred,actual) {mean((pred - actual)^2)}
+```
+
+**Grafici**
+
+1.  *Scatterplot: valori reali vs valori previsti*
+
+    Se la previsione fosse perfetta i punti dovrebbero disporsi esattamente lungo la bisettrice; dunque, più i punti sono vicini ad essa (linea rossa), migliori sono le previsioni del modello.
+
+2.  *Scatterplot: residui vs valori previsti*
+
+    Questo grafico mostra i residui (le differenze tra le bici noleggiate previste ed effettive) rispetto ai valori previsti. Un modello performante avrà residui distribuiti casualmente intorno allo zero (la linea tratteggiata rossa).
+
+### KNN
+
+**Fase di tuning**
+
+L'unico parametro da ottimizzare nel caso del KNN è k, ovvero il numero di "vicini" da considerare per fare la previsione.
+
+```{r}
+set.seed(123)
+par.set <- makeParamSet(
+  makeIntegerParam("k", lower = 1, upper = 50),
+  makeIntegerParam("distance", lower = 1, upper = 2)
+)
+ctrl = makeMBOControl()
+ctrl = setMBOControlTermination(ctrl, iters = 15)
+tune.ctrl = makeTuneControlMBO(mbo.control = ctrl)
+
+colnames(trainset_encoded) <- make.names(colnames(trainset_encoded))
+task <- makeRegrTask(data=trainset_encoded,target="Count")
+run_knn <- tuneParams(makeLearner("regr.kknn"), task, cv3, measures=list(mse),par.set = par.set, control = tune.ctrl,show.info = F)
+```
+
+**Fase di train e test**
+
+```{r}
+set.seed(123)
+model_knn <- kknn(formula = Count ~ ., train = trainset_encoded, test = testset_encoded, k = run_knn$x$k,distance=run_knn$x$distance)
+predictions <- model_knn$fitted.values
+actual_values <- testset_encoded$Count
+
+(knn_results <- data.frame(RMSE = rmse(predictions,actual_values), MAE = mae(predictions,actual_values), R_squared = r_squared(predictions,actual_values), MAPE = mape(predictions,actual_values)))
+rmse_valid_knn <- sqrt(run_knn$mbo.result$y); rmse_valid_knn
+```
+
+**Grafici**
+
+Il KNN è un modello molto semplice, dunque non ci aspettiamo una performance ottimale, ma mediocre.
+
+```{r}
+tot_values <- data.frame(cbind(predictions, actual_values))
+ggplot(tot_values, aes(x=predictions, y=actual_values)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  labs(title = "Actual vs Predicted Plot",
+       x = "Predicted",
+       y = "Actual") +
+  theme_minimal()
+
+residuals <- tot_values$actual_values - tot_values$predictions
+tot_values <- data.frame(tot_values, residuals)
+ggplot(tot_values, aes(x=predictions, y=residuals)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 0, col = "red") +
+  labs(title = "Residuals",
+       x = "Predicted Count",
+       y = "Residual Plot") +
+  theme_minimal()
+```
+
+### Support Vector Machine
+
+NB: per garantire al lettore un'esecuzione semi-veloce del codice, riportiamo solo il tuning con kernel radiale, che dopo svariate prove risulta essere sempre il prescelto.
+
+Di conseguenza, gli iperparametri da ottimizzare sono il parametro del kernel radiale (gamma) e l'iperparametro di regolarizzazione (cost).
+
+**Fase di tuning**
+
+```{r}
+set.seed(123)
+par.set = makeParamSet(
+  makeDiscreteParam( "kernel", values=c("radial") ),
+  makeNumericParam( "cost", lower=1.5, upper=1.7, trafo=function(x) 10^x ),
+  makeNumericParam( "gamma", lower=-2, upper=-0.8, trafo=function(x) 10^x)
+  )
+
+ctrl <- makeMBOControl()
+ctrl <- setMBOControlTermination(ctrl, iters = 15)
+tune_ctrl <- makeTuneControlMBO(mbo.control = ctrl)
+task <- makeRegrTask(data=trainset_encoded, target="Count")
+
+run_svm <- tuneParams(makeLearner("regr.svm"), task, cv3, measures = list(mse),par.set = par.set, control = tune_ctrl, show.info = F)
+```
+
+**Fase di train e test**
+
+```{r}
+model_svm <- svm(formula=Count ~., data=trainset_encoded, scale=F,
+             type = "eps-regression", cost=run_svm$x$cost,
+             kernel="radial",gamma=run_svm$x$gamma)
+
+predictions <- predict(model_svm, newdata = testset_encoded)
+actual_values <- testset_encoded$Count
+
+(svm_results <- data.frame(RMSE = rmse(predictions,actual_values), MAE = mae(predictions,actual_values), R_squared = r_squared(predictions,actual_values), MAPE = mape(predictions,actual_values)))
+rmse_valid_svm <- sqrt(run_svm$mbo.result$y) ; rmse_valid_svm
+```
+
+**Grafici**
+
+Già dalla lettura delle metriche, si nota che l'SVM non riesce a cogliere il modello sottostante i dati e i grafici confermano questa affermazione.
+
+```{r}
+tot_values <- data.frame(cbind(predictions, actual_values))
+ggplot(tot_values, aes(x=predictions, y=actual_values)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  labs(title = "Actual vs Predicted Plot",
+       x = "Predicted",
+       y = "Actual") +
+  theme_minimal()
+
+residuals <- tot_values$actual_values - tot_values$predictions
+tot_values <- data.frame(tot_values, residuals)
+ggplot(tot_values, aes(x=predictions, y=residuals)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 0, col = "red") +
+  labs(title = "Residuals",
+       x = "Predicted Count",
+       y = "Residual Plot") +
+  theme_minimal()
+```
+
+### Random Forest
+
+**Fase di tuning**
+
+Nel caso delle Random Forest, gli iperparametri da ottimizzare sono il numero di alberi (ntrees) e il numero di variabili selezionate casualmente come candidati per ogni divisione nei nodi degli alberi decisionali (mtry).
+
+```{r}
+set.seed(123)
+par.set_rf <- makeParamSet(
+  makeIntegerParam("ntree", lower = 100, upper = 500),
+  makeIntegerParam("mtry", lower = 1, upper = 20)
+)
+
+ctrl_rf <- makeMBOControl()
+ctrl_rf <- setMBOControlTermination(ctrl_rf, iters = 15)
+tune_ctrl_rf <- makeTuneControlMBO(mbo.control = ctrl_rf)
+
+colnames(trainset_encoded) <- make.names(colnames(trainset_encoded))
+task_rf <- makeRegrTask(data = trainset_encoded, target = "Count")
+
+run_rf <- tuneParams(makeLearner("regr.randomForest"), task_rf, cv3, measures = list(mse),par.set = par.set_rf, control = tune_ctrl_rf, show.info = F)
+```
+
+**Fase di train e test**
+
+```{r}
+rf_model <- randomForest(Count ~ ., data = trainset_encoded,
+                         ntree = run_rf$x$ntree,
+                         mtry = run_rf$x$mtry)
+
+colnames(testset_encoded) <- make.names(colnames(testset_encoded))
+predictions <- predict(rf_model, testset_encoded)
+actual_values <- testset_encoded$Count
+
+(rf_results <- data.frame(RMSE = rmse(predictions,actual_values), MAE = mae(predictions,actual_values), R_squared = r_squared(predictions,actual_values), MAPE = mape(predictions,actual_values)))
+rmse_valid_rf <- sqrt(run_rf$mbo.result$y) ; rmse_valid_rf
+```
+
+**Grafici**
+
+Le metriche del RF risultano, fino ad ora, le migliori ottenute; infatti, anche la visualizzazione grafica conferma il risultato numerico. Notiamo infatti un ottimo adattamento dei punti alla bisettrice (solo alcuni punti risultano previsti male, molti meno rispetto agli algoritmi precedenti) ed anche i residui si dispongono vicino allo 0.
+
+```{r}
+tot_values <- data.frame(cbind(predictions, actual_values))
+ggplot(tot_values, aes(x=predictions, y=actual_values)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  labs(title = "Actual vs Predicted Plot",
+       x = "Predicted",
+       y = "Actual") +
+  theme_minimal()
+
+residuals <- tot_values$actual_values - tot_values$predictions
+tot_values <- data.frame(tot_values, residuals)
+ggplot(tot_values, aes(x=predictions, y=residuals)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 0, col = "red") +
+  labs(title = "Residuals",
+       x = "Predicted Count",
+       y = "Residual Plot") +
+  theme_minimal()
+```
+
+### Reti neurali (1 hidden layer)
+
+**Fase di tuning**
+
+Per queste NN (rete a singolo strato con back propagation) gli iperparametri da ottimizzare sono: il numero di neuroni dell'unico hidden layer (size), il learning rate (decay) e il numero massimo di iterazioni (maxit).
+
+```{r}
+set.seed(123)
+par.set_nn <- makeParamSet(
+  makeIntegerParam("size", lower = 1, upper = 20),
+  makeNumericParam("decay", lower = 0.01, upper = 0.1), 
+  makeIntegerParam("maxit", lower = 100, upper = 500)
+)
+
+ctrl_nn <- makeMBOControl()
+ctrl_nn <- setMBOControlTermination(ctrl_nn, iters = 15)
+tune_ctrl_nn <- makeTuneControlMBO(mbo.control = ctrl_nn)
+
+task_nn <- makeRegrTask(data = trainset_encoded, target = "Count")
+
+run_nn <- tuneParams(makeLearner("regr.nnet"), task_nn, cv3, measures = list(mse),par.set = par.set_nn, control = tune_ctrl_nn, show.info = F)
+```
+
+**Fase di train e test**
+
+```{r}
+nn0 <- nnet(Count ~ ., data = trainset_encoded,
+            size=run_nn$x$size, linout=TRUE, skip=TRUE, MaxNWts=10000, trace=FALSE,maxit=run_nn$x$maxit,decay = run_nn$x$decay)
+
+colnames(testset_encoded) <- make.names(colnames(testset_encoded))
+predictions <- predict(nn0, testset_encoded)
+actual_values <- testset_encoded$Count
+
+(nn_results <- data.frame(RMSE = rmse(predictions,actual_values), MAE = mae(predictions,actual_values), R_squared = r_squared(predictions,actual_values), MAPE = mape(predictions,actual_values)))
+rmse_valid_nn <- sqrt(run_nn$mbo.result$y) ; rmse_valid_nn
+```
+
+**Grafici**
+
+Le reti neurali con un singolo hidden layer non producono buoni risultati.
+
+```{r}
+tot_values <- data.frame(cbind(predictions, actual_values))
+colnames(tot_values) <- c("predictions","actual_values")
+ggplot(tot_values, aes(x=predictions, y=actual_values)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  labs(title = "Actual vs Predicted Plot",
+       x = "Predicted",
+       y = "Actual") +
+  theme_minimal()
+
+residuals <- tot_values$actual_values - tot_values$predictions
+tot_values <- data.frame(tot_values, residuals)
+ggplot(tot_values, aes(x=predictions, y=residuals)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 0, col = "red") +
+  labs(title = "Residuals",
+       x = "Predicted Count",
+       y = "Residual Plot") +
+  theme_minimal()
+```
+
+### XGBoost
+
+**Fase di tuning**
+
+Gli iperparametri da ottimizzare sono: il learning rate (eta), il numero massimo di nodi a partire dal nodo radice fino al suo nodo foglia più profondo (max_depth), percentuale di dati utilizzata per la costruzione dell'albero (subsample), percentuale di features utilizzate per la costruzione dell'albero (colsample_bytree), numero di iterazioni di boosting/alberi (nrounds).
+
+```{r}
+set.seed(123)
+par.set <- makeParamSet(
+  makeNumericParam("eta", lower = 0.01, upper = 0.3),
+  makeIntegerParam("max_depth", lower = 3, upper = 10),
+  makeNumericParam("subsample", lower = 0.5, upper = 1),
+  makeNumericParam("colsample_bytree", lower = 0.5, upper = 1),
+  makeIntegerParam("nrounds", lower = 50, upper = 500),
+  makeNumericParam("gamma", lower = 0, upper = 5),
+  makeNumericParam("lambda", lower = 0, upper = 2),
+  makeNumericParam("alpha", lower = 0, upper = 2),
+  makeNumericParam("min_child_weight", lower = 1, upper = 10)
+)
+
+ctrl <- makeMBOControl()
+ctrl <- setMBOControlTermination(ctrl, iters = 15)
+ctrl <- setMBOControlInfill(ctrl, crit = makeMBOInfillCritCB())
+tune.ctrl <- makeTuneControlMBO(mbo.control = ctrl)
+task <- makeRegrTask(data = trainset_encoded, target = "Count")
+
+run_xgb <- tuneParams(
+  makeLearner("regr.xgboost"),
+  task,
+  cv3,
+  measures = mse,
+  par.set = par.set,
+  control = tune.ctrl,
+  show.info = F
+)
+bestpar <- run_xgb$x
+params <- list(
+  eta = bestpar$eta,
+  max_depth = bestpar$max_depth,
+  subsample = bestpar$subsample,
+  colsample_bytree = bestpar$colsample_bytree,
+  gamma = bestpar$gamma,
+  lambda = bestpar$lambda,
+  alpha = bestpar$alpha,
+  min_child_weight = bestpar$min_child_weight,
+  objective = "reg:squarederror",
+  eval_metric = "rmse"
+)
+nrounds <- bestpar$nrounds
+```
+
+**Fase di train e test**
+
+```{r}
+train_data <- as.matrix(trainset_encoded %>% dplyr::select(-Count))
+train_label <- trainset_encoded$Count
+dtrain <- xgb.DMatrix(data = train_data, label = train_label)
+
+test_data <- as.matrix(testset_encoded %>% dplyr::select(-Count))
+test_label <- testset_encoded$Count
+dtest <- xgb.DMatrix(data = test_data, label = test_label)
+
+model_xgb <- xgboost(
+  params = params,
+  data = dtrain,
+  nrounds = nrounds,
+  verbose = 1
+)
+pred_xgboost <- predict(model_xgb, dtest)
+
+(xgb_results <- data.frame(RMSE = rmse(pred_xgboost,test_label), MAE = mae(pred_xgboost,test_label), R_squared = r_squared(pred_xgboost,test_label), MAPE = mape(pred_xgboost,test_label)))
+rmse_valid_xgb <- sqrt(run_xgb$mbo.result$y) ; rmse_valid_xgb
+```
+
+**Grafici e Commenti**
+
+Xgboost migliora leggermente i risultati ottenuti con le RF, infatti i 2 metodi hanno un' idea base simile, ma che poi viene sviluppata diversamente. Entrambi utilizzano gli alberi decisionali, ma RF costruisce alberi indipendenti in parallelo usando il bagging e aggrega le previsioni di tutti gli alberi, mentre XGB costruisce alberi sequenzialmente usando il boosting gradientale e combina le previsioni aggiungendo i nuovi alberi per correggere gli errori degli alberi precedenti (includendo inoltre una regolarizzazione per penalizzare la complessità del modello)
+
+```{r}
+tot_values <- data.frame(cbind(pred_xgboost, test_label))
+colnames(tot_values) <- c("predictions","actual_values")
+ggplot(tot_values, aes(x=predictions, y=actual_values)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 1, col = "red") +
+  labs(title = "Actual vs Predicted Plot",
+       x = "Predicted",
+       y = "Actual") +
+  theme_minimal()
+
+residuals <- tot_values$actual_values - tot_values$predictions
+tot_values <- data.frame(tot_values, residuals)
+ggplot(tot_values, aes(x=predictions, y=residuals)) +
+  geom_point(col="deepskyblue") +
+  geom_abline(intercept = 0, slope = 0, col = "red") +
+  labs(title = "Residuals",
+       x = "Predicted Count",
+       y = "Residual Plot") +
+  theme_minimal()
+```
+
+### Confronto
+
+Confrontiamo gli algoritmi tramite RMSE, MAE e MAPE.
+
+```{r}
+results <- bind_rows(knn_results,rf_results,svm_results,nn_results,xgb_results)
+rownames(results) <- NULL
+results <- cbind(algorithm=c("KNN","RF","SVM","NN","XGB"),results)
+results 
+
+results_long <- results %>%
+  dplyr::select(-R_squared) %>% 
+  pivot_longer(cols = c(RMSE, MAE, MAPE), names_to = "Indice", values_to = "Valore") 
+
+results_long$Indice <-factor(results_long$Indice, levels = c("RMSE","MAE","MAPE"))
+
+ggplot(results_long, aes(x = Indice, y = Valore, color = algorithm, group = algorithm)) +
+  geom_point(size = 4) +
+  geom_line(size = 2) +
+  labs(x = "Indice", y = "Valore", color = "Algoritmo") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_color_manual(values = c("KNN" = "deepskyblue", "RF" = "forestgreen", "SVM" = "darkblue","NN"="orange","XGB"="red2"))
+```
+
+# Classificazione
+
+Per prima cosa definiamo tre funzioni utili alla valutazione delle performance di ogni modello.\
+Inoltre, definiamo un'ulteriore funzione che consenta di visualizzare al meglio la matrice di confusione.
+
+```{r}
+accuracy <- function(pred,actual) {
+  sum(pred == actual) / length(pred) 
+}
+gini <- function(pred,actual) {
+  gini <- 0
+  cluster_j <- unique(pred)
+  for (cluster in cluster_j) {
+    etichette_nel_cluster <- actual[pred == cluster]
+    freq_etichette <- table(etichette_nel_cluster)
+    gini_cluster <- 1 - sum((freq_etichette / sum(freq_etichette))^2)
+    gini <- gini + gini_cluster * length(etichette_nel_cluster) / length(actual)
+  }
+  return(gini)
+}
+
+calculate_metrics <- function(confusion_matrix) {
+  true_positives <- diag(confusion_matrix)
+  false_positives <- colSums(confusion_matrix) - true_positives
+  false_negatives <- rowSums(confusion_matrix) - true_positives
+  
+  precision <- ifelse(true_positives + false_positives == 0, 0, true_positives / (true_positives + false_positives))
+  recall <- ifelse(true_positives + false_negatives == 0, 0, true_positives / (true_positives + false_negatives))
+  f1_score <- ifelse(precision + recall == 0, 0, 2 * (precision * recall) / (precision + recall))
+  
+  metrics <- data.frame(
+    Precision = precision,
+    Recall = recall,
+    F1_Score = f1_score)
+  return(metrics)
+}
+
+plot_confusion_matrix <- function(cm,title) {
+  cm_melted <- melt(cm)
+  colnames(cm_melted) <- c("pred","actual","value")
+  ggplot(data = cm_melted, aes_string(x = "pred", y = "actual", fill = "value")) +
+    geom_tile() +
+    geom_text(aes_string(label = "value"), color = 'black') +
+    scale_fill_gradient(low = 'white', high = 'deepskyblue') +
+    labs(x = "Predicted", y = "Actual", title = title) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5))
+}
+```
+
+Creiamo ora la target Domanda, dividendo la variabile Count del dataset originario in tre livelli: domanda bassa (\<300), domanda media (300-1000) e domanda alta (\>1000).
+
+Le 3 classi così ottenute sono bilanciate.
+
+```{r}
+trainset <- trainset %>%
+  mutate(Domanda = cut(Count,
+                       breaks = c(0,300,1000,Inf),
+                       labels = c("Low", "Medium", "High"),
+                       include.lowest = TRUE)) %>%
+  mutate(Domanda = as.factor(Domanda))
+testset <- testset %>%
+  mutate(Domanda = cut(Count,
+                       breaks = c(0,300,1000,Inf),
+                       labels = c("Low", "Medium", "High"),
+                       include.lowest = TRUE)) %>%
+  mutate(Domanda = as.factor(Domanda))
+
+data_encoded <- data_encoded %>%
+  mutate(Domanda = cut(Count,
+                       breaks = c(0,300,1000,Inf),
+                       labels = c("Low", "Medium", "High"),
+                       include.lowest = TRUE)) %>%
+  mutate(Domanda = as.factor(Domanda)) %>%
+  dplyr::select(-Count)
+
+trainset_encoded <- data_encoded[ixs$Resample1,]
+testset_encoded <- data_encoded[-ixs$Resample1,]
+
+cat("% in TrainSet di valori per classe:", table(trainset_encoded$Domanda)/dim(trainset_encoded)[1]*100, "\n")
+cat("% in TestSet di valori per classe:", table(testset_encoded$Domanda)/dim(testset_encoded)[1]*100, "\n")
+
+```
+
+## Regressione logistica ordinale
+
+NOTA: partiamo da questo modello perchè, nonostante la sua semplicità, ci consente di dare un'interpretazione molto intuitiva alla relazione tra la target e le features, confermando quanto osservato nell'analisi esplorativa.
+
+Prima di tutto alleniamo e validiamo il modello attraverso una cross-validation, salvando training e validation accuracy per visualizzarle.
+
+```{r}
+ixs <- createFolds(y=trainset$Domanda,k=10,list=T)
+trnAcc <- valAcc <- numeric(length(ixs)) 
+
+for( k in 1:length(ixs) ) {
+  trnFold <- trainset[-ixs[[k]],]
+  valFold <- trainset[ixs[[k]],]
+  
+  # training the model
+  mod <- polr(Domanda ~ sinHour + cosHour + Temp + Humidity + WindSpeed + Visibility + SolarRad + Season + Holiday + Rain_dummy + Snow_dummy, 
+              data=trnFold)
+  predicted_classes <- predict(mod, newdata = trnFold, type = "class")
+  trnAcc[k] <- accuracy(predicted_classes,trnFold$Domanda)
+  
+  # validating the model
+  predicted_classes2 <- predict(mod, newdata = valFold, type = "class")
+  valAcc[k] <- accuracy(predicted_classes2,valFold$Domanda)
+}
+
+plot( trnAcc, type="o", pch=19, lwd=3, col="blue", ylab="Accuracy", xlab="fold",ylim=range(c(1,trnAcc,valAcc)))
+lines( valAcc, type="o", pch=19, lwd=3, col="green3")
+abline(h=1,col="red",lty=2,lwd=2)
+legend( "topright", legend=c("training","validation"), col=c("blue","green3"),lwd=3, pch=19, cex=1.3 )
+```
+
+I risultati ottenuti sono soddisfacenti (considerando che si tratta di un modello molto semplice). Procediamo dunque alla stima di questo modello sull'intero training e alla selezione del modello tramite Akaike Information Criterion (AIC).
+
+```{r}
+trainset$Season <- relevel(trainset$Season, ref = "Winter")
+trainset$Rain_dummy <- relevel(trainset$Rain_dummy, ref= "No rain")
+trainset$Snow_dummy <- relevel(trainset$Snow_dummy, ref = "No snow")
+trainset$Holiday <- relevel(trainset$Holiday, ref = "No Holiday")
+mod <- polr(Domanda ~ sinHour + cosHour + Temp + Humidity + WindSpeed + Visibility + SolarRad + Season + Holiday + Rain_dummy + Snow_dummy,
+            data=trainset)
+stepmod <- stepAIC(mod, data=training, trace=FALSE)
+summary(stepmod)
+```
+
+**Interpretazione di (alcuni) coefficienti**
+
+NB: Per l'interpretazione dei coefficienti associati alle variabili indipendenti è necessario cambiare il segno (perchè la funzione polr stima i coefficienti con segno invertito), inoltre tutti i coefficienti, comprese le intercette, vanno trasformate tramite esponenziale, avendo usato una link function logistica.
+
+```{r}
+data.frame("Variabile"=c("Medium|High","SeasonSummer","Rain_dummyElevate rain","HolidayHoliday"),"Coefficiente Moltiplicativo" = exp(c(2.6570, -1.90969, 5.23246, 0.65364 )))
+```
+
+-   Medium\|High: La probabilità che la domanda sia bassa/media è 14.3 volte la probabilità che sia alta, quando le variabili numeriche assumono il loro valore medio e le categoriche la modalità di riferimento (Season = Winter, Holiday = No Holiday, Rain_dummy = No rain e Snow_dummy = No snow).
+
+-   SeasonSummer: La probabilità che la domanda sia bassa in estate è 0.15 volte la stessa probabilità in inverno.
+
+-   Rain_dummyElevate rain: La probabilità che la domanda sia bassa quando piove molto è 187 volte la stessa probabilità quando non piove.
+
+-   HolidayHoliday: La probabilità che la domanda sia bassa quando è vacanza, è 1.9 volte la stessa probabilità quando non è vacanza.
+
+Le interpretazioni dei coefficienti sembrano essere ragionevoli e in linea con le considerazionali preliminari.
+
+Procediamo ora con la previsione dei valori sul test set.
+
+```{r}
+predicted_prob <- predict(stepmod, newdata = testset, type = "probs")
+predicted_classes <- predict(stepmod, newdata = testset, type = "class")
+plot_confusion_matrix(table(predicted_classes,testset$Domanda),"Confusion Matrix Regressione")
+cat("Accuracy TestSet:", accuracy(predicted_classes,testset$Domanda)*100, "%\n")
+```
+
+Usiamo la funzione *train* per verificare che la logistica sia la link function che meglio si adatta ai nostri dati. L' algoritmo di addestramento in realtà seleziona la Cauchy, ma, dato che l'incremento di accuracy è minimo, manteniamo la logistica.
+
+Infatti, scegliere la Cauchy come link function comprometterebbe l'interpretabilità del modello.
+
+```{r}
+ctrl <- trainControl(method = "cv", number = 10)  # 10-fold cross-validation
+set.seed(123)
+polr_model <- train(Domanda ~ sinHour + cosHour + Temp + Humidity + WindSpeed + Visibility + SolarRad + Season + Holiday + Rain_dummy + Snow_dummy, data = trainset, method = "polr", trControl = ctrl, metric = "Accuracy")
+print(polr_model)
+```
+
+## KNN
+
+```{r}
+X_train_encoded <- trainset_encoded %>%
+  dplyr::select(-Domanda)
+y_train_encoded <- trainset_encoded$Domanda
+X_test_encoded = testset_encoded %>%
+  dplyr::select(-Domanda) 
+y_test_encoded = testset_encoded$Domanda
+```
+
+**Fase di tuning**
+
+Gli iperparametri da ottimizzare sono k e il valore di N della distanza di Minkowski (N=1 distanza di Manhattan, N=2 distanza euclidea).
+
+```{r}
+set.seed(123)
+par.set <- makeParamSet(
+  makeIntegerParam("k", lower = 1, upper = 50),
+  makeIntegerParam("distance",lower=1, upper=2)
+)
+ctrl = makeMBOControl()
+ctrl = setMBOControlTermination(ctrl, iters = 15)
+tune.ctrl = makeTuneControlMBO(mbo.control = ctrl)
+dati <- data.frame(cbind(scale(X_train_encoded), Domanda = y_train_encoded))
+dati <- dati %>%
+  mutate(Domanda = as.factor(Domanda))
+task <- makeClassifTask(data=dati,target="Domanda")
+run_knn2 = tuneParams(makeLearner("classif.kknn"), task, cv3, measures=acc,par.set = par.set, control = tune.ctrl,show.info = F)
+```
+
+**Fase di training e test**
+
+```{r}
+knn2 = kknn(formula = Domanda ~ .,train = trainset_encoded,
+           test = testset_encoded,k = run_knn2$mbo.result$x$k, 
+           distance = run_knn2$mbo.result$x$distance)
+pred_knn2 <- knn2$fitted.values
+
+conf_matrix_knn2 = table(pred_knn2, testset_encoded$Domanda)
+plot_confusion_matrix(conf_matrix_knn2, "Confusion Matrix KNN")
+(knn_results2 <- data.frame(accuracy_vali = run_knn2$y, accuracy_test = accuracy(pred_knn2,y_test_encoded),gini = gini(pred_knn2,y_test_encoded)))
+calculate_metrics(conf_matrix_knn2)
+```
+
+Il processo di ottimizzazione individua k = 8 e distanza di Manhattan.
+
+## Random Forest
+
+**Fase di tuning**\
+Nel caso delle Random Forest, gli iperparametri da ottimizzare sono il numero di alberi (ntrees) e il numero di variabili selezionate casualmente come candidati per ogni divisione nei nodi degli alberi decisionali (mtry).
+
+```{r}
+set.seed(123)
+par.set_rf <- makeParamSet(
+  makeIntegerParam("ntree", lower = 100, upper = 500),
+  makeIntegerParam("mtry", lower = 1, upper = 10)
+)
+
+ctrl_rf <- makeMBOControl()
+ctrl_rf <- setMBOControlTermination(ctrl_rf, iters = 15)
+tune_ctrl_rf <- makeTuneControlMBO(mbo.control = ctrl_rf)
+
+task_rf <- makeClassifTask(data = trainset_encoded, target = "Domanda")
+
+run_rf <- tuneParams(makeLearner("classif.randomForest"), task_rf, cv3, measures = acc,par.set = par.set_rf, control = tune_ctrl_rf, show.info = F)
+```
+
+**Fase di training e test\
+**Implementiamo l'algoritmo con i valori degli iperparametri appena individuati e usiamolo per fare previsione sul test.
+
+```{r}
+forest <- randomForest(Domanda ~ .,data = trainset_encoded, ntrees = run_rf$mbo.result$x$ntree, mtry = run_rf$mbo.result$x$mtry)
+
+pred_forest <- predict(forest, newdata = testset_encoded)
+
+conf_matrix_forest = table(pred_forest, y_test_encoded)
+plot_confusion_matrix(conf_matrix_forest, "Confusion Matrix Random Forest")
+(forest_results <- data.frame(accuracy_vali = run_rf$y, accuracy_test = accuracy(pred_forest, y_test_encoded), gini = gini(pred_forest, y_test_encoded)))
+calculate_metrics(conf_matrix_forest)
+```
+
+## Support Vector Machine (SVM)
+
+**Fase di tuning**
+
+NB: per garantire al lettore un'esecuzione semi-veloce del codice, riportiamo solo il tuning con kernel radiale, che dopo svariate prove risulta essere sempre il prescelto.
+
+Di conseguenza, gli iperparametri da ottimizzare sono il parametro del kernel radiale (gamma) e l'iperparametro di regolarizzazione (cost).
+
+```{r}
+set.seed(123) 
+par.set <- makeParamSet(
+  makeDiscreteParam("kernel",values=c("radial")),
+  makeNumericParam( "cost", lower=-4, upper=4, trafo=function(x) 10^x ),
+  makeNumericParam( "gamma", lower=-5, upper=5, trafo=function(x) 10^x) 
+)
+ctrl = makeMBOControl()
+ctrl = setMBOControlTermination(ctrl, iters = 15)
+ctrl <- setMBOControlInfill(ctrl,crit=makeMBOInfillCritCB()) # Confidence Bound
+tune.ctrl = makeTuneControlMBO(mbo.control = ctrl)
+
+task <- makeClassifTask(data=trainset_encoded,target="Domanda")
+
+run_svm <- tuneParams(makeLearner("classif.svm"),task,cv3,measures=acc,
+                 par.set = par.set, control = tune.ctrl,show.info = FALSE)
+```
+
+**Fase di training e test**
+
+```{r}
+model_full <- svm( formula=Domanda ~ ., data=trainset_encoded,type="C-classification", cost=10^(run_svm$mbo.result$x$cost), kernel="radial", gamma=10^(run_svm$mbo.result$x$gamma), probability=T)
+pred_svm <- predict( model_full, newdata=testset_encoded )
+
+conf_matrix_svm = table(pred_svm, y_test_encoded)
+plot_confusion_matrix(conf_matrix_svm, "Confusion Matrix SVM")
+(svm_results <- data.frame(accuracy_vali = run_svm$y, accuracy_test = accuracy(pred_svm, y_test_encoded),gini = gini(pred_svm,y_test_encoded)))
+calculate_metrics(conf_matrix_svm)
+
+cat("> Numero di support vectors:",model_full$nSV,"\n")
+```
+
+*Commenti:* Il numero di support vectors sembra, a primo impatto, elevato (indice di overfitting), ma dato il numero di osservazioni nel dataset è accettabile.
+
+## Reti Neurali
+
+**Fase di tuning**
+
+Per queste NN (rete a singolo strato con back propagation) gli iperparametri da ottimizzare sono: il numero di neuroni dell'unico hidden layer (size), il learning rate (decay) e il numero massimo di iterazioni (maxit).
+
+```{r}
+set.seed(123)
+param <- makeParamSet(
+  makeIntegerParam("size", lower = 1, upper = 30), 
+  makeNumericParam("decay", lower = 0.01, upper = 0.1),
+  makeIntegerParam("maxit", lower = 100, upper = 500) 
+)
+
+ctrl_nn <- makeMBOControl()
+ctrl_nn <- setMBOControlTermination(ctrl_nn, iters = 15)
+tune_ctrl_nn <- makeTuneControlMBO(mbo.control = ctrl_nn)
+
+task_nn <- makeClassifTask(data = trainset_encoded, target = "Domanda")
+
+run_nn <- tuneParams(makeLearner("classif.nnet"), task_nn, cv3, measures = acc,par.set = param, control = tune_ctrl_nn, show.info = F)
+```
+
+**Fase di training e test**
+
+```{r}
+nn <- nnet(
+  Domanda ~ .,
+  data = trainset_encoded,
+  size = run_nn$mbo.result$x$size,
+  decay = run_nn$mbo.result$x$decay,
+  maxit = run_nn$mbo.result$x$maxit,
+  linear.output = FALSE
+)
+pred_nn <- predict(nn, testset_encoded, type="class")
+pred_nn <- factor(pred_nn, levels=c("Low","Medium","High"))
+
+conf_matrix_nn = table(pred_nn, y_test_encoded)
+plot_confusion_matrix(conf_matrix_nn, "Confusion Matrix Neural Network")
+(nn_results <- data.frame(accuracy_vali = run_nn$y,accuracy_test = accuracy(pred_nn,y_test_encoded),gini = gini(pred_nn,y_test_encoded)))
+calculate_metrics(conf_matrix_nn)
+```
+
+## XGBoost
+
+**Fase di tuning**
+
+Gli iperparametri da ottimizzare sono numerosi e contenuti in par.set().
+
+```{r}
+set.seed(124)
+par.set <- makeParamSet(
+  makeNumericParam("eta", lower = 0.01, upper = 0.3),
+  makeIntegerParam("max_depth", lower = 3, upper = 10),
+  makeNumericParam("subsample", lower = 0.5, upper = 1),
+  makeNumericParam("colsample_bytree", lower = 0.5, upper = 1),
+  makeIntegerParam("nrounds", lower = 50, upper = 500),
+  makeNumericParam("gamma", lower = 0, upper = 5),
+  makeNumericParam("lambda", lower = 0.1, upper = 1.5),
+  makeNumericParam("alpha", lower = 0, upper = 1),
+  makeNumericParam("min_child_weight", lower = 0.5, upper = 2)
+)
+ctrl <- makeMBOControl()
+ctrl <- setMBOControlTermination(ctrl, iters = 15)
+ctrl <- setMBOControlInfill(ctrl, crit = makeMBOInfillCritCB())
+tune.ctrl <- makeTuneControlMBO(mbo.control = ctrl)
+task <- makeClassifTask(data = trainset_encoded, target = "Domanda")
+run_xgb <- tuneParams(
+  makeLearner("classif.xgboost"),
+  task,
+  resampling = makeResampleDesc("CV", iters = 3),
+  measures = acc,
+  par.set = par.set,
+  control = tune.ctrl,
+  show.info = F
+)
+bestpar <- run_xgb$x
+params <- list(
+  eta = bestpar$eta,
+  max_depth = bestpar$max_depth,
+  subsample = bestpar$subsample,
+  colsample_bytree = bestpar$colsample_bytree,
+  gamma = bestpar$gamma,
+  lambda = bestpar$lambda,
+  alpha = bestpar$alpha,
+  min_child_weight = bestpar$min_child_weight,
+  objective = "multi:softprob",
+  num_class = 3,
+  eval_metric = "mlogloss"
+)
+
+nrounds <- bestpar$nrounds
+```
+
+**Fase di training e test**
+
+```{r}
+train_data <- as.matrix(trainset_encoded %>% dplyr::select(-Domanda))
+train_label <- as.integer(trainset_encoded$Domanda)-1
+dtrain <- xgb.DMatrix(data = train_data, label = train_label)
+test_data <- as.matrix(testset_encoded %>% dplyr::select(-Domanda))
+test_label <- as.integer(testset_encoded$Domanda)-1
+dtest <- xgb.DMatrix(data = test_data, label = test_label)
+
+final_model <- xgboost(
+  params = params,
+  data = train_data,
+  label = train_label,
+  nrounds = nrounds,
+  verbose = 1
+)
+
+pred_probs <- predict(final_model, dtest,type="response")
+pred_probs_matrix <- matrix(pred_probs, ncol = 3, byrow = TRUE)
+pred_xgb <- apply(pred_probs_matrix, 1, which.max)-1
+
+conf_matrix_xgb <- table(pred_xgb, test_label)
+plot_confusion_matrix(conf_matrix_xgb, "Confusion Matrix XGBoost")
+(xgb_results <- data.frame(accuracy_vali = run_xgb$y, accuracy_test = accuracy(pred_xgb,test_label), gini = gini(pred_xgb,test_label)))
+calculate_metrics(conf_matrix_xgb)
+```
+
+## Confronto
+
+Prima di tutto, confrontiamo gli algoritmi di classificazione utilizzando le metriche accuracy e indice di Gini.
+
+```{r}
+results <- bind_rows(knn_results2,forest_results,svm_results,nn_results,xgb_results)
+rownames(results) <- NULL
+results <- cbind(algorithm=c("KNN","RF","SVM","NN","XGB"),results)
+results
+
+results_long <- results %>%
+  pivot_longer(cols = c(accuracy_vali, accuracy_test, gini), names_to = "Indice", values_to = "Valore")
+
+ggplot(results_long, aes(x = algorithm, y = Valore, color = Indice, group = Indice)) +
+  geom_point(size = 3) +
+  geom_line() +
+  labs(x = "Algoritmo", y = "Valore", color = "Indice di bontà") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_color_manual(values = c("accuracy_vali" = "deepskyblue", "accuracy_test" = "red3", "gini" = "forestgreen"))
+```
+
+Le metriche evidenziano che XGB è sicuramente l'algoritmo che performa meglio, seguito da RF e NN, che hanno performance assimilabili (lievemente migliori per RF), SVM e infine all'ultimo posto troviamo KNN.
+
+Abbiamo dunque deciso di "scartare" il modello KNN, essendo quello che performa peggio.
+
+Per effettuare un confronto visivo tra le performance dei modelli abbiamo scelto le curve ROC. Per disegnarle è sufficiente avere la probabilità di appartenenza alle categorie (Low, Medium e High) di ogni punto.
+
+E' importante sottolineare che le curve ROC sono generalmente applicabili a problemi di classificazione a 2 classi, ma abbiamo comunque deciso di implementarle creando una funzione ad hoc che permettesse di disegnare una curva per ogni livello.
+
+```{r}
+forest_probs <- predict(forest, testset_encoded, type="prob")
+svm_probs <- attr(predict(model_full, testset_encoded, probability=TRUE), "probabilities")
+nn_probs <- predict(nn, testset_encoded)
+xgb_probs <- predict(final_model, dtest)
+xgb_probs <- matrix(xgb_probs, ncol = 3, byrow = TRUE)
+
+roc_curves <- function(true_labels, probabilities, class, class_labels, models) {
+  plot_data <- data.frame()
+  
+  for (i in seq_along(probabilities)) {
+    roc_curve <- roc(true_labels == class, probabilities[[i]][, which(class_labels == class)])
+    auc_value <- auc(roc_curve)
+    plot_data <- rbind(plot_data, data.frame(
+      specificity = 1 - roc_curve$specificities,
+      sensitivity = roc_curve$sensitivities,
+      model = models[i],
+      auc = rep(auc_value, length(roc_curve$sensitivities))
+    ))
+  }
+  
+  ggplot(plot_data, aes(x = specificity,y =sensitivity, color = model)) +
+    geom_line() +
+    geom_abline(linetype = "dashed") +
+    labs(title = paste("ROC Curve for class", class),
+         x = "1 - Specificity",
+         y = "Sensitivity") +
+    scale_color_manual(values = c("red3", "forestgreen", "deepskyblue", "yellow2")) +
+    theme_minimal()+
+    theme(plot.title = element_text(hjust = 0.5)) + 
+    xlim(0, 0.5) +  
+    ylim(0.5, 1) 
+}
+
+class_labels <- levels(y_test_encoded)
+models <- c("Random Forest", "SVM", "Neural Network", "XGBoost")
+
+for (class in class_labels) {
+  print(roc_curves(y_test_encoded, list(forest_probs, svm_probs, nn_probs, xgb_probs), class, class_labels, models))
+}
+```
+
+Le curve avvalorano quanto osservato in precedenza: tra i 4 SVM è quello con performance peggiori, trovandosi al di sotto delle altre per tutte e tre le classi. I restanti tra algoritmi hanno un comportamento molto simile nel discriminare la classe Medium e High, mentre NN ha performance peggiori nella classe High.
+
+E' importante osservare che l'AUC (Area Under The Roc Curve) per la classe Medium e' inferiore rispetto alle altre due classi per tutti gli algoritmi considerati. Questo denota una minore capacita' discriminatoria (seppur comunque abbastanza buona) della classe Medium rispetto alle due classi più estreme.
+
+Questo risultato era in realtà già stato evidenziato in precedenza dalle tabelle contenenti precision, recall e f1-score: in tutti gli algoritmi allenati i valori relativi alla seconda classe erano sempre inferiori rispetto agli altri.
+
+## Visualizzazione
+
+Soffermiamo ora l'attenzione sull'algoritmo maggiormente performante (XGBoost) per visualizzare i risultati.
+
+Per rappresentare i punti è ovviamente necessario considerare solo due dimensioni: scegliamo dunque le variabili che influenzano maggiormente la creazione delle classi.
+
+```{r}
+importance_matrix <- xgb.importance(feature_names = colnames(train_data), model = final_model)
+ggplot(as.data.frame(importance_matrix), aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill="forestgreen",col="black") +
+  coord_flip() +
+  labs(title = "Feature Importance", x = "Feature", y = "Importance") +
+  theme_minimal() 
+```
+
+Oltre ai punti colorati in base alla classe di appartenenza (ground truth), evidenziamo anche i punti "misclassificati" e l'incertezza della classificazione.
+
+```{r}
+uncertainty <- 1-apply(pred_probs_matrix,1,max)
+data_grafico <- data.frame(cbind(testset_encoded,Hour = data[-ixs$Resample1,3],uncertainty))
+pred_xgb <- factor(pred_xgb, levels = c(0, 1, 2), labels = c("Low", "Medium", "High"))
+misclass <- pred_xgb != y_test_encoded
+
+data_grafico$Domanda <- as.factor(data_grafico$Domanda)
+
+ggplot(data_grafico, aes(x=Temp, y=Hour, color=Domanda)) +  
+  scale_colour_manual(values=c("red2","yellow2","forestgreen"))+
+  geom_point(aes(size=uncertainty))+
+  geom_point(data_grafico[misclass,], mapping=aes(x=Temp, y=Hour, size =uncertainty),colour="black")+ 
+  theme_minimal()+
+  labs(x="Temp", y="Hour", title="Scatterplot Temp VS Hour")+
+  theme(legend.position = "right") +
+  theme(plot.title = element_text(hjust =0.5, size = 14, face = "bold")) 
+  
+
+ggplot(data_grafico, aes(x=Temp, y=Humidity, color=Domanda)) +   scale_colour_manual(values=c("red2","yellow2","forestgreen"))+
+  geom_point(aes(size=uncertainty))+
+  geom_point(data_grafico[misclass,], mapping=aes(x=Temp, y=Humidity, size=uncertainty),colour="black")+ 
+  theme_minimal()+
+  labs(x="Temp", y="Humidity",title="Scatterplot Temp VS Humidity")+
+  theme(legend.position = "right") +
+  theme(plot.title = element_text(hjust =0.5, size = 14, face = "bold"))
+```
+
+E' evidente che queste rappresentazioni siano molto riduttive e che non permettano di cogliere la complessità del problema in esame, dato che consideriamo solo due variabili per volta rispetto alla totalità di quelle in gioco.
+
+Proviamo a rappresentare un grafico tridimensionale per cercare di cogliere meglio la differenziazione tra le classi. Ovviamente, anche con tre variabili la rappresentazione non può cogliere la totalità del problema.
+
+```{r}
+data_grafico %>% plot_ly(type="scatter3d",mode="markers",colors=c("red2","yellow2","forestgreen")) %>% add_markers(x=~Temp, y=~Humidity, z=~Hour,color=as.factor(pred_xgb),size=3)
+```
+
+## Combining classification algorithms
+
+Combiniamo ora i risultati degli algoritmi di classificazione testati imputando l'etichetta maggiormente presente (nel caso in cui vi sia incertezza, ovvero le classi siano suddivise in 50/50, imputiamo "Unknown").
+
+```{r}
+labels <- data.frame(true = testset$Domanda,
+                     forest = pred_forest,
+                     svm = pred_svm,
+                     nn = pred_nn,
+                     xgb = pred_xgb)
+majority_vote <- function(row) {
+  counts <- table(row)
+  max_count <- max(counts)
+  if (sum(counts == max_count) > 1) {return("Unknown")} 
+  else {return(names(which.max(counts)))}
+}
+
+majority_labels <- apply(labels[,-1], 1, majority_vote)
+labels <- cbind(labels,majority_labels)
+```
+
+```{r}
+data[rownames(labels[labels$majority_labels=="Unknown",]),]
+
+data[rownames(labels[labels$true != labels$knn &
+                       labels$knn == labels$forest &
+                       labels$knn == labels$svm &
+                       labels$knn == labels$nn &
+                       labels$knn == labels$xgb,]),]
+```
+
+Osserviamo le osservazioni con maggiore incertezza.\
+Una buona parte sono valori che si trovano sulle "soglie" che separano le classi: non siamo dunque stupiti che gli algoritmi non siano d'accordo nella loro classificazione.
+
+Notiamo inoltre che molti dei valori più incerti sono quelli appartenenti alla classe "Medium": questo conferma quando visto in precedenza sulla maggiore incertezza degli algoritmi nell'identificazione degli elementi di questa classe.
